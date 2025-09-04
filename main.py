@@ -4,12 +4,19 @@ from typing import List, Optional
 from datetime import datetime
 import time
 
+from notice_content_scraper import NoticeContentScraper
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
 from database import get_db, engine
 from models import Base, StockNotice
 from scraper_selenium import CodalSeleniumScraper
 
 # Create tables
 Base.metadata.create_all(bind=engine)
+
+content_executor = ThreadPoolExecutor(max_workers=3)
+
 
 app = FastAPI(title="Ultra-Fast Codal Scraper")
 
@@ -296,6 +303,270 @@ def ultra_fast_scrape(symbol: str, max_pages: int, force_refresh: bool = False):
             scraper.close()
         if db:
             db.close()
+
+
+@app.get("/notice/{notice_id}")
+async def get_notice_by_id(
+        notice_id: int,
+        scrape_content: bool = False,
+        db: Session = Depends(get_db)
+):
+    """Get notice by ID with optional content scraping"""
+
+    notice = db.query(StockNotice).filter(StockNotice.id == notice_id).first()
+
+    if not notice:
+        raise HTTPException(status_code=404, detail="Notice not found")
+
+    result = {
+        "id": notice.id,
+        "symbol": notice.symbol,
+        "company_name": notice.company_name,
+        "title": notice.title,
+        "publish_time": notice.publish_time,
+        "html_link": notice.html_link,
+        "has_html": notice.has_html,
+        "created_at": notice.created_at
+    }
+
+    # Optionally scrape content from the link
+    if scrape_content and notice.html_link:
+        scraper = NoticeContentScraper()
+        try:
+            loop = asyncio.get_event_loop()
+            content = await loop.run_in_executor(
+                content_executor,
+                scraper.scrape_notice_content,
+                notice.html_link,
+                True  # scrape_all_sheets
+            )
+            result["scraped_content"] = content
+        finally:
+            scraper.close()
+
+    return result
+
+
+@app.get("/notices/search")
+async def search_notices_by_title(
+        keyword: str,
+        limit: int = 10,
+        offset: int = 0,
+        scrape_content: bool = False,
+        db: Session = Depends(get_db)
+):
+    """Search notices by keyword in title"""
+
+    # Search in database
+    query = db.query(StockNotice).filter(
+        StockNotice.title.ilike(f"%{keyword}%")
+    )
+
+    total = query.count()
+    notices = query.offset(offset).limit(limit).all()
+
+    results = []
+    for notice in notices:
+        notice_data = {
+            "id": notice.id,
+            "symbol": notice.symbol,
+            "company_name": notice.company_name,
+            "title": notice.title,
+            "publish_time": notice.publish_time,
+            "html_link": notice.html_link,
+            "has_html": notice.has_html
+        }
+
+        # Optionally scrape content
+        if scrape_content and notice.html_link and len(results) < 3:  # Limit to 3 for performance
+            scraper = NoticeContentScraper()
+            try:
+                loop = asyncio.get_event_loop()
+                content = await loop.run_in_executor(
+                    content_executor,
+                    scraper.scrape_notice_content,
+                    notice.html_link,
+                    False  # Don't scrape all sheets for search results
+                )
+                notice_data["scraped_content"] = content
+            finally:
+                scraper.close()
+
+        results.append(notice_data)
+
+    return {
+        "keyword": keyword,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "results": results
+    }
+
+
+@app.post("/notice/{notice_id}/scrape")
+async def scrape_notice_content(
+        notice_id: int,
+        scrape_all_sheets: bool = True,
+        db: Session = Depends(get_db)
+):
+    """Scrape content from a specific notice"""
+
+    notice = db.query(StockNotice).filter(StockNotice.id == notice_id).first()
+
+    if not notice:
+        raise HTTPException(status_code=404, detail="Notice not found")
+
+    if not notice.html_link:
+        raise HTTPException(status_code=400, detail="Notice has no HTML link")
+
+    scraper = NoticeContentScraper()
+    try:
+        loop = asyncio.get_event_loop()
+        content = await loop.run_in_executor(
+            content_executor,
+            scraper.scrape_notice_content,
+            notice.html_link,
+            scrape_all_sheets
+        )
+
+        # Extract summary statistics
+        summary = {
+            "total_sheets": len(content.get('sheets', [])),
+            "total_tables": len(content.get('all_tables', [])),
+            "total_numbers": len(content.get('all_text', [])),
+            "has_error": content.get('error') is not None
+        }
+
+        return {
+            "notice_id": notice_id,
+            "symbol": notice.symbol,
+            "title": notice.title,
+            "summary": summary,
+            "content": content
+        }
+
+    finally:
+        scraper.close()
+
+
+@app.post("/notices/batch-scrape")
+async def batch_scrape_notice_content(
+        notice_ids: List[int],
+        scrape_all_sheets: bool = False,
+        db: Session = Depends(get_db)
+):
+    """Scrape content from multiple notices"""
+
+    notices = db.query(StockNotice).filter(
+        StockNotice.id.in_(notice_ids),
+        StockNotice.html_link.isnot(None)
+    ).all()
+
+    if not notices:
+        raise HTTPException(status_code=404, detail="No notices found with HTML links")
+
+    results = []
+
+    # Process in parallel but limit concurrency
+    semaphore = asyncio.Semaphore(3)  # Max 3 concurrent scrapes
+
+    async def scrape_with_semaphore(notice):
+        async with semaphore:
+            scraper = NoticeContentScraper()
+            try:
+                loop = asyncio.get_event_loop()
+                content = await loop.run_in_executor(
+                    content_executor,
+                    scraper.scrape_notice_content,
+                    notice.html_link,
+                    scrape_all_sheets
+                )
+
+                return {
+                    "notice_id": notice.id,
+                    "symbol": notice.symbol,
+                    "title": notice.title,
+                    "status": "success",
+                    "sheets_count": len(content.get('sheets', [])),
+                    "tables_count": len(content.get('all_tables', [])),
+                    "error": content.get('error')
+                }
+            except Exception as e:
+                return {
+                    "notice_id": notice.id,
+                    "symbol": notice.symbol,
+                    "title": notice.title,
+                    "status": "error",
+                    "error": str(e)
+                }
+            finally:
+                scraper.close()
+
+    # Create tasks for all notices
+    tasks = [scrape_with_semaphore(notice) for notice in notices]
+    results = await asyncio.gather(*tasks)
+
+    return {
+        "total_requested": len(notice_ids),
+        "total_processed": len(results),
+        "results": results
+    }
+
+
+@app.get("/notices/filter")
+async def filter_notices(
+        symbol: Optional[str] = None,
+        title_contains: Optional[str] = None,
+        has_html: Optional[bool] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        limit: int = 10,
+        offset: int = 0,
+        db: Session = Depends(get_db)
+):
+    """Advanced filtering for notices"""
+
+    query = db.query(StockNotice)
+
+    if symbol:
+        query = query.filter(StockNotice.symbol == symbol)
+
+    if title_contains:
+        query = query.filter(StockNotice.title.ilike(f"%{title_contains}%"))
+
+    if has_html is not None:
+        query = query.filter(StockNotice.has_html == has_html)
+
+    if start_date:
+        query = query.filter(StockNotice.publish_time >= start_date)
+
+    if end_date:
+        query = query.filter(StockNotice.publish_time <= end_date)
+
+    total = query.count()
+    notices = query.order_by(StockNotice.publish_time.desc()).offset(offset).limit(limit).all()
+
+    return {
+        "total": total,
+        "filters": {
+            "symbol": symbol,
+            "title_contains": title_contains,
+            "has_html": has_html,
+            "start_date": start_date,
+            "end_date": end_date
+        },
+        "results": [
+            {
+                "id": n.id,
+                "symbol": n.symbol,
+                "company_name": n.company_name,
+                "title": n.title,
+                "publish_time": n.publish_time,
+                "html_link": n.html_link,
+                "has_html": n.has_html
+            } for n in notices
+        ]
+    }
 
 
 if __name__ == "__main__":
