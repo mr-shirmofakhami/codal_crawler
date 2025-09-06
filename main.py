@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
+from selenium.webdriver.common.by import By
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import datetime
@@ -11,6 +12,8 @@ from concurrent.futures import ThreadPoolExecutor
 from database import get_db, engine
 from models import Base, StockNotice
 from scraper_selenium import CodalSeleniumScraper
+
+from financial_statement_scraper import FinancialStatementScraper
 
 # Create tables
 Base.metadata.create_all(bind=engine)
@@ -449,69 +452,6 @@ async def scrape_notice_content(
         scraper.close()
 
 
-@app.post("/notices/batch-scrape")
-async def batch_scrape_notice_content(
-        notice_ids: List[int],
-        scrape_all_sheets: bool = False,
-        db: Session = Depends(get_db)
-):
-    """Scrape content from multiple notices"""
-
-    notices = db.query(StockNotice).filter(
-        StockNotice.id.in_(notice_ids),
-        StockNotice.html_link.isnot(None)
-    ).all()
-
-    if not notices:
-        raise HTTPException(status_code=404, detail="No notices found with HTML links")
-
-    results = []
-
-    # Process in parallel but limit concurrency
-    semaphore = asyncio.Semaphore(3)  # Max 3 concurrent scrapes
-
-    async def scrape_with_semaphore(notice):
-        async with semaphore:
-            scraper = NoticeContentScraper()
-            try:
-                loop = asyncio.get_event_loop()
-                content = await loop.run_in_executor(
-                    content_executor,
-                    scraper.scrape_notice_content,
-                    notice.html_link,
-                    scrape_all_sheets
-                )
-
-                return {
-                    "notice_id": notice.id,
-                    "symbol": notice.symbol,
-                    "title": notice.title,
-                    "status": "success",
-                    "sheets_count": len(content.get('sheets', [])),
-                    "tables_count": len(content.get('all_tables', [])),
-                    "error": content.get('error')
-                }
-            except Exception as e:
-                return {
-                    "notice_id": notice.id,
-                    "symbol": notice.symbol,
-                    "title": notice.title,
-                    "status": "error",
-                    "error": str(e)
-                }
-            finally:
-                scraper.close()
-
-    # Create tasks for all notices
-    tasks = [scrape_with_semaphore(notice) for notice in notices]
-    results = await asyncio.gather(*tasks)
-
-    return {
-        "total_requested": len(notice_ids),
-        "total_processed": len(results),
-        "results": results
-    }
-
 
 @app.get("/notices/filter")
 async def filter_notices(
@@ -568,6 +508,367 @@ async def filter_notices(
         ]
     }
 
+@app.post("/financial-statements/search")
+async def search_financial_statements(
+        symbol: Optional[str] = None,
+        exact_title: Optional[str] = None,
+        limit: int = 10,
+        db: Session = Depends(get_db)
+):
+    """Search for financial statement notices"""
+
+    query = db.query(StockNotice)
+
+    # Filter for financial statements
+    query = query.filter(
+        or_(
+            StockNotice.title.contains("اطلاعات و صورت‌های مالی"),
+            StockNotice.title.contains("اطلاعات و صورتهای مالی")
+        )
+    )
+
+    if symbol:
+        query = query.filter(StockNotice.symbol == symbol)
+
+    if exact_title:
+        query = query.filter(StockNotice.title == exact_title)
+
+    notices = query.order_by(StockNotice.publish_time.desc()).limit(limit).all()
+
+    return {
+        "total": len(notices),
+        "financial_statements": [
+            {
+                "id": n.id,
+                "symbol": n.symbol,
+                "company_name": n.company_name,
+                "title": n.title,
+                "publish_time": n.publish_time,
+                "html_link": n.html_link
+            } for n in notices
+        ]
+    }
+
+
+@app.get("/financial-statement/by-exact-title")
+async def get_financial_statement_by_exact_title(
+        title: str,
+        symbol: Optional[str] = None,
+        output_format: str = "code",
+        db: Session = Depends(get_db)
+):
+    """Get financial statement by exact title match"""
+
+    query = db.query(StockNotice).filter(StockNotice.title == title)
+
+    if symbol:
+        query = query.filter(StockNotice.symbol == symbol)
+
+    notice = query.first()
+
+    if not notice:
+        raise HTTPException(status_code=404, detail="Notice not found with exact title")
+
+    # Check if it's a financial statement
+    if "اطلاعات و صورت‌های مالی" not in notice.title and "اطلاعات و صورتهای مالی" not in notice.title:
+        raise HTTPException(
+            status_code=400,
+            detail="This notice is not a financial statement"
+        )
+
+    if not notice.html_link:
+        raise HTTPException(status_code=400, detail="Notice has no HTML link")
+
+    # Extract the financial statement
+    scraper = FinancialStatementScraper()
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            content_executor,
+            scraper.scrape_income_statement,
+            notice.html_link
+        )
+
+        if result.get('error'):
+            raise HTTPException(status_code=500, detail=f"Scraping error: {result['error']}")
+
+        # Generate code output
+        code_output = scraper.generate_code_output(result)
+
+        return {
+            "notice_id": notice.id,
+            "symbol": notice.symbol,
+            "company_name": notice.company_name,
+            "title": notice.title,
+            "publish_time": notice.publish_time,
+            "sheet_name": result['sheet_name'],
+            "code": code_output,
+            "formatted_data": result.get('formatted_data') if output_format != "code" else None,
+            "extraction_time": result.get('extraction_time')
+        }
+
+    finally:
+        scraper.close()
+
+
+@app.get("/financial-statement/{notice_id}")
+async def get_financial_statement(
+        notice_id: int,
+        output_format: str = "json",  # json, code, or dataframe
+        db: Session = Depends(get_db)
+):
+    """Get financial statement data for notices with 'اطلاعات و صورت‌های مالی' in title"""
+
+    # Get the notice
+    notice = db.query(StockNotice).filter(StockNotice.id == notice_id).first()
+
+    if not notice:
+        raise HTTPException(status_code=404, detail="Notice not found")
+
+    # Check if title contains the required text
+    if "اطلاعات و صورت‌های مالی" not in notice.title and "اطلاعات و صورتهای مالی" not in notice.title:
+        raise HTTPException(
+            status_code=400,
+            detail="This notice does not appear to be a financial statement. Title must contain 'اطلاعات و صورت‌های مالی'"
+        )
+
+    if not notice.html_link:
+        raise HTTPException(status_code=400, detail="Notice has no HTML link")
+
+    # Scrape the financial statement
+    scraper = FinancialStatementScraper()
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            content_executor,
+            scraper.scrape_income_statement,
+            notice.html_link
+        )
+
+        if result.get('error'):
+            raise HTTPException(status_code=500, detail=f"Scraping error: {result['error']}")
+
+        # Format output based on requested format
+        if output_format == "code":
+            code_output = scraper.generate_code_output(result)
+            return {
+                "notice_id": notice_id,
+                "symbol": notice.symbol,
+                "title": notice.title,
+                "sheet_name": result['sheet_name'],
+                "code": code_output,
+                "extraction_time": result.get('extraction_time')
+            }
+        elif output_format == "dataframe":
+            return {
+                "notice_id": notice_id,
+                "symbol": notice.symbol,
+                "title": notice.title,
+                "sheet_name": result['sheet_name'],
+                "dataframe": result['table_data']['dataframe'] if result.get('table_data') else None,
+                "extraction_time": result.get('extraction_time')
+            }
+        else:  # json format
+            return {
+                "notice_id": notice_id,
+                "symbol": notice.symbol,
+                "title": notice.title,
+                "sheet_name": result['sheet_name'],
+                "formatted_data": result.get('formatted_data'),
+                "table_data": result.get('table_data'),
+                "extraction_time": result.get('extraction_time')
+            }
+
+    finally:
+        scraper.close()
+
+
+@app.post("/financial-statements/batch-extract")
+async def batch_extract_financial_statements(
+        notice_ids: List[int],
+        output_format: str = "json",
+        db: Session = Depends(get_db)
+):
+    """Extract financial statements from multiple notices"""
+
+    # Get notices that are financial statements
+    notices = db.query(StockNotice).filter(
+        StockNotice.id.in_(notice_ids),
+        or_(
+            StockNotice.title.contains("اطلاعات و صورت‌های مالی"),
+            StockNotice.title.contains("اطلاعات و صورتهای مالی")
+        ),
+        StockNotice.html_link.isnot(None)
+    ).all()
+
+    if not notices:
+        raise HTTPException(status_code=404, detail="No financial statement notices found")
+
+    async def extract_statement(notice):
+        scraper = FinancialStatementScraper()
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                content_executor,
+                scraper.scrape_income_statement,  # Corrected method name
+                notice.html_link
+            )
+
+            if output_format == "code":
+                code = scraper.generate_code_output(result)
+                return {
+                    "notice_id": notice.id,
+                    "symbol": notice.symbol,
+                    "title": notice.title,
+                    "status": "success" if not result.get('error') else "error",
+                    "code": code if not result.get('error') else None,
+                    "error": result.get('error')
+                }
+            else:
+                return {
+                    "notice_id": notice.id,
+                    "symbol": notice.symbol,
+                    "title": notice.title,
+                    "status": "success" if not result.get('error') else "error",
+                    "data": result.get('formatted_data') if not result.get('error') else None,
+                    "error": result.get('error')
+                }
+
+        except Exception as e:
+            return {
+                "notice_id": notice.id,
+                "symbol": notice.symbol,
+                "title": notice.title,
+                "status": "error",
+                "error": str(e)
+            }
+        finally:
+            scraper.close()
+
+    # Process in parallel with concurrency limit
+    semaphore = asyncio.Semaphore(2)  # Max 2 concurrent extractions
+
+    async def extract_with_semaphore(notice):
+        async with semaphore:
+            return await extract_statement(notice)
+
+    tasks = [extract_with_semaphore(notice) for notice in notices]
+    results = await asyncio.gather(*tasks)
+
+    return {
+        "total_requested": len(notice_ids),
+        "total_processed": len(results),
+        "output_format": output_format,
+        "results": results
+    }
+
+
+
+@app.get("/test-financial-scraper")
+async def test_financial_scraper(url: str):
+    """Test the financial scraper directly with a URL"""
+
+    scraper = FinancialStatementScraper()
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            content_executor,
+            scraper.scrape_income_statement,
+            url
+        )
+
+        return {
+            "url": url,
+            "result": result,
+            "code": scraper.generate_code_output(result) if not result.get('error') else None
+        }
+
+    finally:
+        scraper.close()
+
+
+@app.get("/financial-statement/check/{notice_id}")
+async def check_financial_statement(
+        notice_id: int,
+        db: Session = Depends(get_db)
+):
+    """Check if a notice is a financial statement"""
+
+    notice = db.query(StockNotice).filter(StockNotice.id == notice_id).first()
+
+    if not notice:
+        raise HTTPException(status_code=404, detail="Notice not found")
+
+    is_financial = ("اطلاعات و صورت‌های مالی" in notice.title or
+                    "اطلاعات و صورتهای مالی" in notice.title)
+
+    return {
+        "notice_id": notice_id,
+        "symbol": notice.symbol,
+        "title": notice.title,
+        "is_financial_statement": is_financial,
+        "has_html_link": notice.html_link is not None,
+        "html_link": notice.html_link
+    }
+
+
+@app.get("/financial-statement/test/{notice_id}")
+async def test_financial_statement_scraper(
+        notice_id: int,
+        db: Session = Depends(get_db)
+):
+    """Test endpoint to debug financial statement scraping"""
+
+    notice = db.query(StockNotice).filter(StockNotice.id == notice_id).first()
+
+    if not notice:
+        raise HTTPException(status_code=404, detail="Notice not found")
+
+    if not notice.html_link:
+        raise HTTPException(status_code=400, detail="Notice has no HTML link")
+
+    # Create scraper and test basic functionality
+    scraper = FinancialStatementScraper()
+    try:
+        # Just load the page and check what we can find
+        scraper.driver.get(notice.html_link)
+        time.sleep(3)
+
+        # Check for dropdown
+        dropdown_exists = False
+        dropdown_options = []
+        try:
+            dropdown = scraper.driver.find_element(By.ID, "ddlTable")
+            dropdown_exists = True
+            options = dropdown.find_elements(By.TAG_NAME, "option")
+            dropdown_options = [{"value": opt.get_attribute("value"), "text": opt.text} for opt in options]
+        except:
+            pass
+
+        # Check for tables
+        tables = scraper.driver.find_elements(By.CSS_SELECTOR, "table")
+        table_info = []
+        for i, table in enumerate(tables[:3]):  # Check first 3 tables
+            table_text = table.text[:200]  # First 200 chars
+            table_info.append({
+                "index": i,
+                "class": table.get_attribute("class"),
+                "id": table.get_attribute("id"),
+                "text_preview": table_text
+            })
+
+        return {
+            "notice_id": notice_id,
+            "url": notice.html_link,
+            "dropdown_exists": dropdown_exists,
+            "dropdown_options": dropdown_options,
+            "tables_found": len(tables),
+            "table_info": table_info,
+            "page_title": scraper.driver.title
+        }
+
+    finally:
+        scraper.close()
 
 if __name__ == "__main__":
     import uvicorn
