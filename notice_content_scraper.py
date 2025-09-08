@@ -124,7 +124,7 @@ class NoticeContentScraper:
                             'url': sheet_url,
                             'content': sheet_content
                         })
-                        time.sleep(1)  # Be polite between requests
+                        time.sleep(0.5)  # Be polite between requests
 
             # Aggregate all content
             for sheet in result['sheets']:

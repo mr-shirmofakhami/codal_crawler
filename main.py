@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
 from selenium.webdriver.common.by import By
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, or_, and_
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import datetime
@@ -14,6 +15,8 @@ from models import Base, StockNotice
 from scraper_selenium import CodalSeleniumScraper
 
 from financial_statement_scraper import FinancialStatementScraper
+from fastapi.middleware.cors import CORSMiddleware
+
 
 # Create tables
 Base.metadata.create_all(bind=engine)
@@ -22,6 +25,21 @@ content_executor = ThreadPoolExecutor(max_workers=3)
 
 
 app = FastAPI(title="Ultra-Fast Codal Scraper")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
+        # Add your production domain here
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.post("/scrape/{symbol}")
@@ -554,7 +572,7 @@ async def search_financial_statements(
 async def get_financial_statement_by_exact_title(
         title: str,
         symbol: Optional[str] = None,
-        output_format: str = "code",
+        output_format: str = "json",  # Changed default to "json" to match the other endpoint
         db: Session = Depends(get_db)
 ):
     """Get financial statement by exact title match"""
@@ -592,20 +610,36 @@ async def get_financial_statement_by_exact_title(
         if result.get('error'):
             raise HTTPException(status_code=500, detail=f"Scraping error: {result['error']}")
 
-        # Generate code output
-        code_output = scraper.generate_code_output(result)
-
-        return {
-            "notice_id": notice.id,
-            "symbol": notice.symbol,
-            "company_name": notice.company_name,
-            "title": notice.title,
-            "publish_time": notice.publish_time,
-            "sheet_name": result['sheet_name'],
-            "code": code_output,
-            "formatted_data": result.get('formatted_data') if output_format != "code" else None,
-            "extraction_time": result.get('extraction_time')
-        }
+        # Format output based on requested format (same logic as the other endpoint)
+        if output_format == "code":
+            code_output = scraper.generate_code_output(result)
+            return {
+                "notice_id": notice.id,
+                "symbol": notice.symbol,
+                "title": notice.title,
+                "sheet_name": result['sheet_name'],
+                "code": code_output,
+                "extraction_time": result.get('extraction_time')
+            }
+        elif output_format == "dataframe":
+            return {
+                "notice_id": notice.id,
+                "symbol": notice.symbol,
+                "title": notice.title,
+                "sheet_name": result['sheet_name'],
+                "dataframe": result['table_data']['dataframe'] if result.get('table_data') else None,
+                "extraction_time": result.get('extraction_time')
+            }
+        else:  # json format (default)
+            return {
+                "notice_id": notice.id,
+                "symbol": notice.symbol,
+                "title": notice.title,
+                "sheet_name": result['sheet_name'],
+                "formatted_data": result.get('formatted_data'),
+                "table_data": result.get('table_data'),
+                "extraction_time": result.get('extraction_time')
+            }
 
     finally:
         scraper.close()
