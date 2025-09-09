@@ -83,7 +83,8 @@ def is_financial_statement(title: str) -> bool:
         "صورت های سال مالی",
         "صورتهای سال مالی",
         "اطلاعات مالی",
-        "گزارش مالی"
+        "گزارش مالی",
+        "صورت‌های مالی سال مالی"
     ]
 
     return any(keyword in title for keyword in financial_keywords)
