@@ -66,6 +66,10 @@ class FinancialStatementData(Base):
     other_expenses = Column(Numeric(20, 2), nullable=True)  # ساير هزينه‌ها
     operating_profit = Column(Numeric(20, 2), nullable=True)  # سود(زيان) عملياتى
     financial_expenses = Column(Numeric(20, 2), nullable=True)  # هزينه هاى مالى
+
+    investment_income = Column(Numeric(20, 2), nullable=True)  # درآمد سرمایه‌گذاری‌ها
+    miscellaneous_income = Column(Numeric(20, 2), nullable=True)  # اقلام متفرقهاقلام متفرقه
+
     non_operating_income = Column(Numeric(20, 2), nullable=True)  # ساير درآمدها و هزينه هاى غيرعملياتى
     profit_before_tax = Column(Numeric(20, 2), nullable=True)  # سود(زيان) عمليات در حال تداوم قبل از ماليات
     current_year_tax = Column(Numeric(20, 2), nullable=True)  # سال جاري
@@ -91,6 +95,10 @@ class FinancialStatementData(Base):
     other_expenses_fmt = Column(String(100))
     operating_profit_fmt = Column(String(100))
     financial_expenses_fmt = Column(String(100))
+
+    investment_income_fmt = Column(String(100))
+    miscellaneous_income_fmt = Column(String(100))
+
     non_operating_income_fmt = Column(String(100))
     profit_before_tax_fmt = Column(String(100))
     current_year_tax_fmt = Column(String(100))
@@ -116,3 +124,7 @@ class FinancialStatementData(Base):
         Index('idx_company_period', 'company_symbol', 'period_name'),
         Index('idx_period_order', 'notice_id', 'period_order'),
     )
+
+    def to_dict(self):
+        """Convert model instance to dictionary"""
+        return {column.name: getattr(self, column.name) for column in self.__table__.columns}

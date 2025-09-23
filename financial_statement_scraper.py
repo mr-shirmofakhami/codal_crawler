@@ -383,7 +383,7 @@ class FinancialStatementScraper:
             return None
 
     def format_table_data(self, table_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Format the table data into a structured, JSON-safe format"""
+        """Format the table data into a structured, JSON-safe format - handles both structures"""
         if not table_data or not table_data.get('rows'):
             return {
                 'periods': [],
@@ -414,6 +414,116 @@ class FinancialStatementScraper:
                                 if text not in formatted['periods']:
                                     formatted['periods'].append(text)
 
+        # Field mapping dictionary - handles both structures
+        field_mapping = {
+            # Revenue items (both spellings)
+            "درآمدهاي عملياتي": "operating_revenue",
+            "درآمدهای عملیاتی": "operating_revenue",
+
+            # Cost items (both spellings)
+            "بهاى تمام شده درآمدهاي عملياتي": "cost_of_goods_sold",
+            "بهاى تمام شده درآمدهای عملیاتی": "cost_of_goods_sold",
+
+            # Gross profit (both spellings)
+            "سود(زيان) ناخالص": "gross_profit",
+            "سود (زيان) ناخالص": "gross_profit",
+
+            # Expenses (both spellings)
+            "هزينه‏ هاى فروش، ادارى و عمومى": "selling_admin_expenses",
+            "هزينه‏‌هاى فروش، ادارى و عمومى": "selling_admin_expenses",
+
+            # Impairment (both spellings)
+            "هزينه کاهش ارزش دريافتني‏ ها (هزينه استثنايي)": "impairment_expense",
+            "هزینه کاهش ارزش دریافتنی‌‏ها (هزینه استثنایی)": "impairment_expense",
+
+            # Other income (both spellings)
+            "ساير درآمدها": "other_income",
+            "ساير درآمدها": "other_income",
+
+            # Other expenses (both spellings)
+            "ساير هزينه‌ها": "other_expenses",
+            "سایر هزینه‌ها": "other_expenses",
+
+            # Operating profit (both spellings)
+            "سود(زيان) عملياتى": "operating_profit",
+            "سود (زيان) عملياتي": "operating_profit",
+
+            # Financial expenses (both spellings)
+            "هزينه‏ هاى مالى": "financial_expenses",
+            "هزينه‏‌هاى مالى": "financial_expenses",
+
+            # Non-operating income - Structure 1 (single row)
+            "ساير درآمدها و هزينه ‏هاى غيرعملياتى": "non_operating_income",
+            "سایر درآمدها و هزینه‌های غیرعملیاتی": "non_operating_income",
+
+            # Non-operating income - Structure 2 (split rows)
+            "سایر درآمدها و هزینه‌های غیرعملیاتی- درآمد سرمایه‌گذاری‌ها": "investment_income",
+            "سایر درآمدها و هزینه‌های غیرعملیاتی- اقلام متفرقه": "miscellaneous_income",
+
+            # Profit before tax (both spellings)
+            "سود(زيان) عمليات در حال تداوم قبل از ماليات": "profit_before_tax",
+            "سود (زيان) عمليات در حال تداوم قبل از ماليات": "profit_before_tax",
+
+            # Tax items (both spellings)
+            "سال جاري": "current_year_tax",
+            "سال جاری": "current_year_tax",
+            "سال‌هاي قبل": "prior_years_tax",
+            "سال‌های قبل": "prior_years_tax",
+
+            # Net profit continuing (both spellings)
+            "سود(زيان) خالص عمليات در حال تداوم": "net_profit_continuing",
+            "سود (زيان) خالص عمليات در حال تداوم": "net_profit_continuing",
+
+            # Net profit discontinued (both spellings)
+            "سود (زيان) خالص عمليات متوقف شده": "net_profit_discontinued",
+            "سود (زیان) خالص عملیات متوقف شده": "net_profit_discontinued",
+
+            # Net profit (both spellings)
+            "سود(زيان) خالص": "net_profit",
+            "سود (زيان) خالص": "net_profit",
+
+            # EPS items (both spellings)
+            "عملياتي (ريال)": "operational_eps",
+            "عملیاتی (ریال)": "operational_eps",
+            "غيرعملياتي (ريال)": "non_operational_eps",
+            "غیرعملیاتی (ریال)": "non_operational_eps",
+            "ناشي از عمليات در حال تداوم": "eps_continuing",
+            "ناشی از عملیات در حال تداوم": "eps_continuing",
+            "ناشي از عمليات متوقف شده": "eps_discontinued",
+            "ناشی از عملیات متوقف شده": "eps_discontinued",
+            "سود(زيان) پايه هر سهم": "basic_eps",
+            "سود (زيان) پايه هر سهم": "basic_eps",
+            "سود (زيان) خالص هر سهم – ريال": "diluted_eps",
+            "سود (زیان) خالص هر سهم– ریال": "diluted_eps",
+
+            # Capital (both spellings)
+            "سرمايه": "capital",
+            "سرمایه": "capital"
+        }
+
+        def get_mapped_field(item_name: str) -> str:
+            """Get mapped field name for an item"""
+            item_name_clean = item_name.strip()
+
+            # Try exact match first
+            if item_name_clean in field_mapping:
+                return field_mapping[item_name_clean]
+
+            # Try partial match
+            for persian_key, english_field in field_mapping.items():
+                if persian_key.lower() in item_name_clean.lower() or item_name_clean.lower() in persian_key.lower():
+                    return english_field
+
+            # Try without special characters for better matching
+            import re
+            item_clean = re.sub(r'[‌‏\s\-\(\)]+', '', item_name_clean.lower())
+            for persian_key, english_field in field_mapping.items():
+                key_clean = re.sub(r'[‌‏\s\-\(\)]+', '', persian_key.lower())
+                if key_clean in item_clean or item_clean in key_clean:
+                    return english_field
+
+            return None
+
         # Extract financial items safely
         rows = table_data.get('rows', [])
         for row_index, row in enumerate(rows):
@@ -434,9 +544,13 @@ class FinancialStatementScraper:
             if item_name.replace(',', '').replace('(', '').replace(')', '').replace('-', '').isdigit():
                 continue
 
+            # Get mapped field name
+            mapped_field = get_mapped_field(item_name)
+
             # Create item data safely
             item_data = {
                 'name': item_name,
+                'mapped_field': mapped_field,  # Add mapped field info
                 'values': [],
                 'is_total': bool(row[0].get('is_total', False)) if isinstance(row[0], dict) else False,
                 'row_index': row_index
@@ -460,13 +574,13 @@ class FinancialStatementScraper:
 
             formatted['items'].append(item_data)
 
-        # Extract key metrics safely
+        # Extract key metrics safely using the mapping
         key_metric_patterns = {
-            'operating_revenue': ['درآمدهاي عملياتي', 'درآمدهای عملیاتی', 'فروش'],
-            'gross_profit': ['سود(زيان) ناخالص', 'سود ناخالص', 'سود(زیان) ناخالص'],
-            'operating_profit': ['سود(زيان) عملياتى', 'سود عملیاتی', 'سود(زیان) عملیاتی'],
-            'net_profit': ['سود(زيان) خالص', 'سود خالص', 'سود(زیان) خالص'],
-            'eps': ['سود(زيان) پايه هر سهم', 'سود پایه هر سهم', 'سود (زیان) خالص هر سهم'],
+            'operating_revenue': ['درآمدهاي عملياتي', 'درآمدهای عملیاتی'],
+            'gross_profit': ['سود(زيان) ناخالص', 'سود (زيان) ناخالص'],
+            'operating_profit': ['سود(زيان) عملياتى', 'سود (زيان) عملياتي'],
+            'net_profit': ['سود(زيان) خالص', 'سود (زيان) خالص'],
+            'basic_eps': ['سود(زيان) پايه هر سهم', 'سود (زيان) پايه هر سهم'],
             'capital': ['سرمايه', 'سرمایه']
         }
 
@@ -477,6 +591,7 @@ class FinancialStatementScraper:
                     if pattern in item_name:
                         formatted['key_metrics'][metric_key] = {
                             'name': item_name,
+                            'mapped_field': item.get('mapped_field'),
                             'values': item['values'][:]  # Create a copy to avoid reference issues
                         }
                         break
@@ -487,7 +602,9 @@ class FinancialStatementScraper:
         formatted['summary'] = {
             'total_items': len(formatted['items']),
             'total_periods': len(formatted['periods']),
-            'key_metrics_found': len(formatted['key_metrics'])
+            'key_metrics_found': len(formatted['key_metrics']),
+            'mapped_items': len([item for item in formatted['items'] if item.get('mapped_field')]),
+            'unmapped_items': len([item for item in formatted['items'] if not item.get('mapped_field')])
         }
 
         return formatted

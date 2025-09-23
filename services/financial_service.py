@@ -4,13 +4,25 @@ from sqlalchemy.orm import Session
 from fastapi import HTTPException
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from sqlalchemy import desc, asc, or_
+from database import get_db
+
+from utils.financial_utils import  FINANCIAL_PATTERNS
+# import datetime
+import time
+from datetime import datetime, timezone
+
+
+
 
 from models import StockNotice, FinancialStatementData
-from utils import (
-    is_financial_statement,
+from utils.financial_utils import (
     get_stored_financial_data,
     save_financial_data,
     check_data_exists
+)
+from utils.text_utils import (
+    is_financial_statement
 )
 
 logger = logging.getLogger(__name__)
@@ -300,3 +312,222 @@ class FinancialStatementService:
                 "total_records": 0,
                 "unique_companies": 0
             }
+
+    async def bulk_extract_all_task(
+            self,
+            force_refresh: bool = False,
+            batch_size: int = 50,
+            max_concurrent: int = 2,
+            symbol_filter: Optional[str] = None
+    ):
+        """Background task to extract financial statements for all eligible notices"""
+
+        logger.info("🚀 Starting bulk financial statement extraction")
+
+        try:
+            from database import get_db_session
+
+
+            with get_db_session() as db:
+                # Build query with the same filtering logic as search endpoint
+                query = db.query(StockNotice)
+
+                # Apply symbol filter if provided
+                if symbol_filter:
+                    query = query.filter(StockNotice.symbol.ilike(f"%{symbol_filter}%"))
+
+                # Filter for financial notices using the same patterns
+                financial_conditions = [
+                    StockNotice.title.ilike(f"%{pattern}%")
+                    for pattern in FINANCIAL_PATTERNS
+                ]
+                query = query.filter(or_(*financial_conditions))
+
+                # If not force refresh, exclude notices that already have financial data
+                if not force_refresh:
+                    existing_notice_ids = db.query(FinancialStatementData.notice_id).distinct()
+                    query = query.filter(~StockNotice.id.in_(existing_notice_ids))
+
+                # Order by ID for consistent processing
+                query = query.order_by(StockNotice.id)
+
+                # Get total count
+                total_notices = query.count()
+                logger.info(f"📊 Found {total_notices} financial notices to process")
+
+                if total_notices == 0:
+                    logger.info("✅ No financial notices to process")
+                    return
+
+                # Process in batches
+                processed = 0
+                success_count = 0
+                error_count = 0
+
+                for offset in range(0, total_notices, batch_size):
+                    batch = query.offset(offset).limit(batch_size).all()
+                    logger.info(f"🔄 Processing batch {offset // batch_size + 1}: {len(batch)} notices")
+
+                    # Process batch
+                    batch_results = await self.process_financial_batch(
+                        batch, max_concurrent, force_refresh, db
+                    )
+
+                    # Update counters
+                    processed += len(batch)
+                    success_count += sum(1 for r in batch_results if r.get('success'))
+                    error_count += sum(1 for r in batch_results if not r.get('success'))
+
+                    logger.info(f"📈 Progress: {processed}/{total_notices} notices processed")
+
+                logger.info(f"✅ Bulk extraction completed: {success_count} successful, {error_count} errors")
+
+        except Exception as e:
+            logger.error(f"❌ Bulk extraction failed: {e}")
+            raise
+
+
+
+
+
+    async def extract_financial_data(self, notice_id: int, db: Session):
+        """Extract financial data for a single notice"""
+        try:
+            # Get the notice
+            notice = db.query(StockNotice).filter(StockNotice.id == notice_id).first()
+            if not notice:
+                raise ValueError(f"Notice {notice_id} not found")
+
+
+
+            # Check if it's a financial statement
+            is_financial = any(pattern in notice.title for pattern in FINANCIAL_PATTERNS)
+
+            if not is_financial:
+                logger.warning(f"Notice {notice_id} is not a financial statement: {notice.title}")
+                return None
+
+            # Extract using scraper (your existing logic)
+            scraper = self.scraper_class()
+
+            # Run scraper in thread pool
+            loop = asyncio.get_event_loop()
+            financial_data = await loop.run_in_executor(
+                self.content_executor,
+                scraper.extract_financial_data,
+                notice.link
+            )
+
+            if not financial_data:
+                logger.warning(f"No financial data extracted for notice {notice_id}")
+                return None
+
+            # Save to database
+            financial_record = FinancialStatementData(
+                notice_id=notice_id,
+                company_name=notice.company_name,
+                symbol=notice.symbol,
+                title=notice.title,
+                financial_data=financial_data,
+                extraction_date=datetime.utcnow()
+            )
+
+            db.add(financial_record)
+            db.commit()
+
+            logger.info(f"✅ Saved financial data for notice {notice_id}")
+            return financial_data
+
+        except Exception as e:
+            db.rollback()
+            logger.error(f"❌ Error extracting financial data for notice {notice_id}: {e}")
+            raise
+
+    async def process_financial_batch(
+            self,
+            notices: List[StockNotice],
+            max_concurrent: int,
+            force_refresh: bool,
+            db: Session
+    ) -> List[Dict]:
+        """Process a batch of notices using this financial service"""
+
+        async def extract_single_notice(notice: StockNotice) -> Dict:
+            """Extract financial statement for a single notice using this service"""
+            try:
+                logger.info(f"🎯 Processing notice {notice.id}: {notice.symbol} - {notice.title[:100]}...")
+
+                # Create a new database session for this task
+                task_db = next(get_db())
+
+                try:
+                    # Use this service's get_by_notice_id method
+                    result = await self.get_by_notice_id(
+                        notice.id,
+                        "json",  # Always use JSON format for storage
+                        task_db,
+                        force_refresh
+                    )
+
+                    if result and result.get("formatted_data"):
+                        logger.info(f"✅ Successfully extracted financial data for notice {notice.id}")
+                        return {
+                            "notice_id": notice.id,
+                            "symbol": notice.symbol,
+                            "status": "success",
+                            "records_count": len(result.get("formatted_data", [])),
+                            "from_database": result.get("from_database", False)
+                        }
+                    else:
+                        logger.warning(f"⚠️ No financial data extracted for notice {notice.id}")
+                        return {
+                            "notice_id": notice.id,
+                            "symbol": notice.symbol,
+                            "status": "failed",
+                            "reason": "No financial data found"
+                        }
+
+                finally:
+                    task_db.close()
+
+            except Exception as e:
+                logger.error(f"❌ Error processing notice {notice.id}: {e}")
+                return {
+                    "notice_id": notice.id,
+                    "symbol": notice.symbol,
+                    "status": "failed",
+                    "error": str(e)
+                }
+
+        # Use semaphore for concurrency control
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        async def extract_with_semaphore(notice: StockNotice):
+            async with semaphore:
+                return await extract_single_notice(notice)
+
+        # Process all notices concurrently with semaphore control
+        tasks = [extract_with_semaphore(notice) for notice in notices]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Handle any exceptions that occurred
+        processed_results = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.error(f"Exception in batch processing for notice {notices[i].id}: {result}")
+                processed_results.append({
+                    "notice_id": notices[i].id,
+                    "symbol": notices[i].symbol,
+                    "status": "failed",
+                    "error": str(result)
+                })
+            else:
+                processed_results.append(result)
+
+        return processed_results
+
+
+
+
+
+

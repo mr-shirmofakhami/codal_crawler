@@ -325,14 +325,14 @@ class CodalSeleniumScraper:
             print(f"Fallback extraction failed: {e}")
             return []
 
-    def scrape_multiple_pages(self, symbol, max_pages=1):
+    def scrape_multiple_pages(self, symbol, start_page=1, end_page=1):
         """Stable multi-page scraping"""
         all_notices = []
 
-        print(f"Starting stable scraping for {symbol} - {max_pages} pages")
+        print(f"Starting stable scraping for {symbol} - Pages: {start_page} to {end_page}")
         total_start = time.time()
 
-        for page in range(1, max_pages + 1):
+        for page in range(start_page, end_page + 1):
             page_start = time.time()
 
             notices = self.scrape_with_selenium(symbol, page)
@@ -347,7 +347,7 @@ class CodalSeleniumScraper:
             print(f"Page {page}: {page_time:.1f}s - {len(notices)} notices - Total: {len(all_notices)}")
 
             # Small delay between pages for stability
-            if page < max_pages:
+            if page < end_page:
                 time.sleep(1)
 
         total_time = time.time() - total_start
