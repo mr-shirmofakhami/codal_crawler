@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from models import Base
 
 # PostgreSQL connection
-DATABASE_URL = "postgresql://postgres:123@localhost/codal"
+DATABASE_URL = "postgresql://postgres:123@172.20.2.91/codal"
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
